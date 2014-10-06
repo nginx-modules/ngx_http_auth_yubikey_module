@@ -56,6 +56,7 @@ typedef struct {
 	ngx_str_t					secret_key;
 	ngx_int_t					ttl;
 	ngx_http_complex_value_t	user_file;
+	ngx_str_t					wsapi_url;
 
 	ngx_uint_t					count;
 	ngx_cached_cred_t			cached_cred[NGX_CACHED_CRED_SIZE];
@@ -120,6 +121,14 @@ static ngx_command_t  ngx_http_auth_yubikey_commands[] = {
 	  offsetof(ngx_http_auth_yubikey_loc_conf_t, user_file),
 	  NULL },
 
+	{ ngx_string("auth_yubikey_api_url"),
+	  NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_HTTP_LMT_CONF
+	  					|NGX_CONF_TAKE1,
+	  ngx_conf_set_str_slot,
+	  NGX_HTTP_LOC_CONF_OFFSET,
+	  offsetof(ngx_http_auth_yubikey_loc_conf_t, wsapi_url),
+	  NULL },
+
       ngx_null_command
 };
 
@@ -163,7 +172,8 @@ ngx_http_auth_yubikey_handler(ngx_http_request_t *r)
 
     alcf = ngx_http_get_module_loc_conf(r, ngx_http_auth_yubikey_module);
 
-    if (alcf->realm.len == 0 || alcf->client_id.len == 0 || alcf->secret_key.len == 0) {
+    if (alcf->realm.len == 0 || alcf->client_id.len == 0 ||
+		alcf->secret_key.len == 0 || alcf->wsapi_url.len == 0) {
         return NGX_DECLINED;
     }
 
@@ -190,7 +200,7 @@ ngx_http_auth_yubikey_otp_handler(ngx_http_request_t *r, void *conf)
 	ngx_file_t	file;
     ngx_int_t   rc, declen=0, oldest;
 	ngx_err_t	err;
-	ngx_uint_t	level, i, j;
+	ngx_uint_t	level, i, j, cslot;
 	ngx_md5_t	md5;
 	ngx_str_t	user_file, user;
 	u_char		key[22], *p, *ykey, md5_buf[MD5_DIGEST_LENGTH];
@@ -271,7 +281,6 @@ ngx_http_auth_yubikey_otp_handler(ngx_http_request_t *r, void *conf)
 						ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
 									"Found user %s. Cache (ttl %ud) expired", user.data, alcf->cached_cred[i].ttl);
 					}
-					/* return ngx_http_auth_yubikey_set_realm(r, &alcf->realm); */
 					return NGX_HTTP_UNAUTHORIZED;
 				} else
 					if (r->connection->log->log_level & NGX_LOG_DEBUG_HTTP) {
@@ -303,7 +312,7 @@ ngx_http_auth_yubikey_otp_handler(ngx_http_request_t *r, void *conf)
 
 	ngx_memset(tmpbuf, 0, sizeof(tmpbuf));
 	for(i=0; i<MD5_DIGEST_LENGTH; i++) {
-		sprintf(tmpbuf,"%s%2.2x",tmpbuf,alcf->cached_cred[j].md5[i]);
+		sprintf((char*)tmpbuf,"%s%2.2x",tmpbuf,alcf->cached_cred[j].md5[i]);
 	}
 
 	if (r->connection->log->log_level & NGX_LOG_DEBUG_HTTP) {
@@ -312,11 +321,12 @@ ngx_http_auth_yubikey_otp_handler(ngx_http_request_t *r, void *conf)
 					alcf->ttl,alcf->cached_cred[j].ttl, tmpbuf, r->headers_in.user.data);
 	}
 
+	cslot = j;
 	alcf->count = ++j;
 
 	/* Initialize base64 decoder */
 	base64_init_decodestate(&state);
-	declen=base64_decode_block(alcf->secret_key.data, strlen(alcf->secret_key.data), key, &state);
+	declen=base64_decode_block((char*)alcf->secret_key.data, strlen((char *)alcf->secret_key.data), (char*)key, &state);
 
 	/* Check if auth_yubikey_client_id is set to a proper value */
     if (ngx_atoi(alcf->client_id.data, alcf->client_id.len) <= 0)
@@ -327,7 +337,7 @@ ngx_http_auth_yubikey_otp_handler(ngx_http_request_t *r, void *conf)
     }
 
 	/* Check if the password send to the server has a valid OTP length */
-    if (strlen(r->headers_in.passwd.data) < 32)
+    if (strlen((char*)r->headers_in.passwd.data) < 32)
     {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
         			  "error: ModHex encoded token must be at least 32 characters.");
@@ -342,26 +352,33 @@ ngx_http_auth_yubikey_otp_handler(ngx_http_request_t *r, void *conf)
 		return NGX_HTTP_INTERNAL_SERVER_ERROR;
 	}
 
-    ykclient_set_url_template(ykc, "https://api.yubico.com/wsapi/verify?id=%d&otp=%s");
-    ykclient_set_client (ykc, atoi(alcf->client_id.data), declen, key);
+	/* Set WSAPI URL */
+	if (r->connection->log->log_level & NGX_LOG_DEBUG_HTTP) {
+    	ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
+						"WSApi url \"%s\"", alcf->wsapi_url.data);
+	}
+    ykclient_set_url_template(ykc, (char*)alcf->wsapi_url.data);
+    ykclient_set_client (ykc, atoi((char*)alcf->client_id.data), declen, (char*)key);
 
 	/* Yubikey exist on the server of Yubico, now check the key against the first 12 chars */
 	if (alcf->user_file.value.len > 0) {
-		if ( strstr(buf, user.data) ) {
+		if ( strstr((char*)buf, (char*)user.data) ) {
 			/* User found in file, check against key */
-			p = strstr(buf, user.data);
-			ykey = strstr(p, ":")+1;
-			*strstr(ykey, "\n") = '\0';
+			p = (u_char*)strstr((char*)buf, (char*)user.data);
+			ykey = (u_char*)strstr((char*)p, ":")+1;
+			*strstr((char*)ykey, "\n") = '\0';
 
 			if (ngx_strncmp(ykey, r->headers_in.passwd.data, 12) == 0) {
-				rc = ykclient_request (ykc, r->headers_in.passwd.data);
+				rc = ykclient_request (ykc, (char*)r->headers_in.passwd.data);
 
-				if ((rc=ykclient_check_signature(ykc))!=YKCLIENT_OK) {
+				if (rc!=YKCLIENT_OK) {
         			ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                     			  "ykclient error: %s",
                     			  ykclient_strerror(rc));
 					ykclient_done (&ykc);
-					return NGX_HTTP_FORBIDDEN;
+    				ngx_memzero(&alcf->cached_cred[cslot], sizeof(ngx_cached_cred_t));
+					//return NGX_HTTP_FORBIDDEN;	
+					return ngx_http_auth_yubikey_set_realm(r, &alcf->realm);
 				}
         	} else {
 				if (r->connection->log->log_level & NGX_LOG_DEBUG_HTTP) {
@@ -386,7 +403,6 @@ ngx_http_auth_yubikey_otp_handler(ngx_http_request_t *r, void *conf)
     return NGX_OK;
 }
 
-
 static ngx_int_t
 ngx_http_auth_yubikey_set_realm(ngx_http_request_t *r, ngx_str_t *realm)
 {
@@ -395,7 +411,7 @@ ngx_http_auth_yubikey_set_realm(ngx_http_request_t *r, ngx_str_t *realm)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    r->headers_out.www_authenticate->hash = 1;
+    r->headers_out.www_authenticate->hash = 2;
     ngx_str_set(&r->headers_out.www_authenticate->key, "WWW-Authenticate");
     r->headers_out.www_authenticate->value = *realm;
 
@@ -519,3 +535,6 @@ ngx_http_auth_yubikey_close(ngx_file_t *file)
                       ngx_close_file_n " \"%s\" failed", file->name.data);
     }
 }
+
+
+/* vim: set ts=4 sw=8 tw=0 noet :*/
